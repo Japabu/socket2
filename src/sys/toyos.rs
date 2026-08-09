@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, SyscallError};
 use toyos::net::{self, NetError, TcpSocketId};
 
@@ -341,7 +341,7 @@ enum SocketState {
     },
     /// TCP stream (connected). kernel_fd is a real kernel Socket descriptor.
     Connected {
-        kernel_fd: Fd,
+        kernel_fd: RawHandle,
         socket_id: u32,
         local_port: u16,
         peer_addr: [u8; 4],
@@ -353,7 +353,7 @@ enum SocketState {
     },
     /// TCP listener (bound + listening). kernel_fd is the notify pipe read end.
     Listening {
-        kernel_fd: Fd,
+        kernel_fd: RawHandle,
         socket_id: u32,
         local_addr: [u8; 4],
         local_port: u16,
