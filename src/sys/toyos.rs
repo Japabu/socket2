@@ -481,15 +481,11 @@ pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
 
     let conn = toyos::net::tcp_connect(ip, port, 30000).map_err(net_err_to_io)?;
 
-    // Wrap pipe fds into a kernel socket descriptor
-    let rx_pipe_id = conn.rx.pipe_id()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pipe_id: {e:?}")))?;
-    let tx_pipe_id = conn.tx.pipe_id()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pipe_id: {e:?}")))?;
-    let kernel_fd = syscall::socket_create(rx_pipe_id, tx_pipe_id)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("socket_create: {e:?}")))?;
+    // One duplex handle out of the two simplex ends. The join takes references
+    // of its own, so the ends are closed here.
+    let kernel_fd = syscall::connection_join(conn.rx.fd(), conn.tx.fd())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connection_join: {e:?}")))?;
 
-    // Drop pipes — socket descriptor holds the refcounts
     drop(conn.rx);
     drop(conn.tx);
 
@@ -626,15 +622,10 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
 
     let accepted = toyos::net::tcp_accept(TcpSocketId(socket_id)).map_err(net_err_to_io)?;
 
-    // Wrap pipe fds into a kernel socket descriptor
-    let rx_pipe_id = accepted.rx.pipe_id()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pipe_id: {e:?}")))?;
-    let tx_pipe_id = accepted.tx.pipe_id()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pipe_id: {e:?}")))?;
-    let new_kernel_fd = syscall::socket_create(rx_pipe_id, tx_pipe_id)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("socket_create: {e:?}")))?;
+    // One duplex handle out of the two simplex ends, as in `connect`.
+    let new_kernel_fd = syscall::connection_join(accepted.rx.fd(), accepted.tx.fd())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connection_join: {e:?}")))?;
 
-    // Drop pipes — socket descriptor holds the refcounts
     drop(accepted.rx);
     drop(accepted.tx);
 
