@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, SyscallError};
+use toyos::AsHandle;
 use toyos::net::{self, NetError, TcpSocketId};
 
 use crate::{SockAddr, TcpKeepalive};
@@ -339,9 +340,10 @@ enum SocketState {
         send_timeout: Option<Duration>,
         bind_addr: Option<([u8; 4], u16)>,
     },
-    /// TCP stream (connected). kernel_fd is a real kernel Socket descriptor.
+    /// TCP stream (connected). `handle` is the kernel `Connection` the two
+    /// simplex pipe ends were joined into.
     Connected {
-        kernel_fd: RawHandle,
+        handle: RawHandle,
         socket_id: u32,
         local_port: u16,
         peer_addr: [u8; 4],
@@ -351,9 +353,9 @@ enum SocketState {
         recv_timeout: Option<Duration>,
         send_timeout: Option<Duration>,
     },
-    /// TCP listener (bound + listening). kernel_fd is the notify pipe read end.
+    /// TCP listener (bound + listening). `handle` is the notify pipe's read end.
     Listening {
-        kernel_fd: RawHandle,
+        handle: RawHandle,
         socket_id: u32,
         local_addr: [u8; 4],
         local_port: u16,
@@ -407,10 +409,10 @@ impl Drop for Socket {
     fn drop(&mut self) {
         if let Some(state) = sockets().lock().unwrap().remove(&self.0) {
             match state {
-                SocketState::Connected { kernel_fd, socket_id, .. }
-                | SocketState::Listening { kernel_fd, socket_id, .. } => {
+                SocketState::Connected { handle, socket_id, .. }
+                | SocketState::Listening { handle, socket_id, .. } => {
                     let _ = toyos::net::tcp_close(TcpSocketId(socket_id));
-                    syscall::close(kernel_fd);
+                    syscall::close(handle);
                 }
                 SocketState::Unconnected { .. } => {}
             }
@@ -483,7 +485,7 @@ pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
 
     // One duplex handle out of the two simplex ends. The join takes references
     // of its own, so the ends are closed here.
-    let kernel_fd = syscall::connection_join(conn.rx.fd(), conn.tx.fd())
+    let handle = syscall::connection_join(conn.rx.as_handle(), conn.tx.as_handle())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connection_join: {e:?}")))?;
 
     drop(conn.rx);
@@ -513,7 +515,7 @@ pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
     map.insert(
         fd,
         SocketState::Connected {
-            kernel_fd,
+            handle,
             socket_id: conn.socket_id.0,
             local_port: conn.local_port,
             peer_addr: ip,
@@ -572,7 +574,7 @@ pub(crate) fn listen(fd: RawSocket, _backlog: c_int) -> io::Result<()> {
     map.insert(
         fd,
         SocketState::Listening {
-            kernel_fd: bound.notify.into_fd(),
+            handle: bound.notify.into_raw(),
             socket_id: bound.socket_id.0,
             local_addr: ip,
             local_port: bound.bound_port,
@@ -589,13 +591,13 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
         .get(&fd)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
 
-    let (socket_id, kernel_fd, nonblocking) = match state {
+    let (socket_id, handle, nonblocking) = match state {
         SocketState::Listening {
             socket_id,
-            kernel_fd,
+            handle,
             nonblocking,
             ..
-        } => (*socket_id, *kernel_fd, *nonblocking),
+        } => (*socket_id, *handle, *nonblocking),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -608,13 +610,13 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
     // Wait for a connection notification
     let mut buf = [0u8; 1];
     if nonblocking {
-        match syscall::read_nonblock(kernel_fd, &mut buf) {
+        match syscall::read_nonblock(handle, &mut buf) {
             Ok(_) => {}
             Err(SyscallError::WouldBlock) => return Err(io::ErrorKind::WouldBlock.into()),
             Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
     } else {
-        match syscall::read(kernel_fd, &mut buf) {
+        match syscall::read(handle, &mut buf) {
             Ok(_) => {}
             Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
@@ -623,7 +625,7 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
     let accepted = toyos::net::tcp_accept(TcpSocketId(socket_id)).map_err(net_err_to_io)?;
 
     // One duplex handle out of the two simplex ends, as in `connect`.
-    let new_kernel_fd = syscall::connection_join(accepted.rx.fd(), accepted.tx.fd())
+    let new_handle = syscall::connection_join(accepted.rx.as_handle(), accepted.tx.as_handle())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connection_join: {e:?}")))?;
 
     drop(accepted.rx);
@@ -633,7 +635,7 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
     sockets().lock().unwrap().insert(
         new_fd,
         SocketState::Connected {
-            kernel_fd: new_kernel_fd,
+            handle: new_handle,
             socket_id: accepted.socket_id.0,
             local_port: accepted.local_port,
             peer_addr: accepted.remote_addr,
@@ -691,12 +693,12 @@ pub(crate) fn try_clone(fd: RawSocket) -> io::Result<RawSocket> {
         .get(&fd)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
     match state {
-        SocketState::Connected { kernel_fd, socket_id, local_port, peer_addr, peer_port, nonblocking, nodelay, recv_timeout, send_timeout } => {
-            let new_kernel_fd = syscall::dup(*kernel_fd)
+        SocketState::Connected { handle, socket_id, local_port, peer_addr, peer_port, nonblocking, nodelay, recv_timeout, send_timeout } => {
+            let new_handle = syscall::dup(*handle)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("dup: {e:?}")))?;
             let new_fd = alloc_fd();
             let cloned = SocketState::Connected {
-                kernel_fd: new_kernel_fd,
+                handle: new_handle,
                 socket_id: *socket_id,
                 local_port: *local_port,
                 peer_addr: *peer_addr,
@@ -770,13 +772,13 @@ pub(crate) fn recv(
     let state = map
         .get(&fd)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    let (kernel_fd, nonblocking, recv_timeout) = match state {
+    let (handle, nonblocking, recv_timeout) = match state {
         SocketState::Connected {
-            kernel_fd,
+            handle,
             nonblocking,
             recv_timeout,
             ..
-        } => (*kernel_fd, *nonblocking, *recv_timeout),
+        } => (*handle, *nonblocking, *recv_timeout),
         _ => return Err(io::ErrorKind::NotConnected.into()),
     };
     drop(map);
@@ -787,18 +789,18 @@ pub(crate) fn recv(
     };
 
     if nonblocking {
-        match syscall::read_nonblock(kernel_fd, raw_buf) {
+        match syscall::read_nonblock(handle, raw_buf) {
             Ok(n) => Ok(n),
             Err(SyscallError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
     } else if let Some(timeout) = recv_timeout {
         let poller = toyos::poller::Poller::new(1);
-        poller.poll_add_fd(kernel_fd, toyos::poller::IORING_POLL_IN, 0);
+        poller.watch_raw(handle, toyos::poller::READABLE, 0);
         let mut ready = false;
         poller.wait(1, timeout.as_nanos() as u64, |_| ready = true);
         if ready {
-            match syscall::read(kernel_fd, raw_buf) {
+            match syscall::read(handle, raw_buf) {
                 Ok(n) => Ok(n),
                 Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
             }
@@ -806,7 +808,7 @@ pub(crate) fn recv(
             Err(io::ErrorKind::TimedOut.into())
         }
     } else {
-        match syscall::read(kernel_fd, raw_buf) {
+        match syscall::read(handle, raw_buf) {
             Ok(n) => Ok(n),
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
@@ -818,30 +820,30 @@ pub(crate) fn send(fd: RawSocket, buf: &[u8], _flags: c_int) -> io::Result<usize
     let state = map
         .get(&fd)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    let (kernel_fd, nonblocking, send_timeout) = match state {
+    let (handle, nonblocking, send_timeout) = match state {
         SocketState::Connected {
-            kernel_fd,
+            handle,
             nonblocking,
             send_timeout,
             ..
-        } => (*kernel_fd, *nonblocking, *send_timeout),
+        } => (*handle, *nonblocking, *send_timeout),
         _ => return Err(io::ErrorKind::NotConnected.into()),
     };
     drop(map);
 
     if nonblocking {
-        match syscall::write_nonblock(kernel_fd, buf) {
+        match syscall::write_nonblock(handle, buf) {
             Ok(n) => Ok(n),
             Err(SyscallError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
     } else if let Some(timeout) = send_timeout {
         let poller = toyos::poller::Poller::new(1);
-        poller.poll_add_fd(kernel_fd, toyos::poller::IORING_POLL_OUT, 0);
+        poller.watch_raw(handle, toyos::poller::WRITABLE, 0);
         let mut ready = false;
         poller.wait(1, timeout.as_nanos() as u64, |_| ready = true);
         if ready {
-            match syscall::write(kernel_fd, buf) {
+            match syscall::write(handle, buf) {
                 Ok(n) => Ok(n),
                 Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
             }
@@ -849,7 +851,7 @@ pub(crate) fn send(fd: RawSocket, buf: &[u8], _flags: c_int) -> io::Result<usize
             Err(io::ErrorKind::TimedOut.into())
         }
     } else {
-        match syscall::write(kernel_fd, buf) {
+        match syscall::write(handle, buf) {
             Ok(n) => Ok(n),
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
